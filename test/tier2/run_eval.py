@@ -28,11 +28,15 @@ SCRIPT     = SKILL_DIR / "scripts" / "sk-sessions.py"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+MODEL = "claude-sonnet-4-6"  # overridden by --model flag
+
+
 def run_claude(prompt: str, *, allow_bash: bool = False, timeout: int = 60) -> str:
     """Run claude -p with the session-summary skill loaded."""
+    # Skills auto-load from ~/.claude/skills/ — no --skill flag needed for claude -p
     cmd = [
         "claude", "-p", prompt,
-        "--skill", str(SKILL_DIR),
+        "--model", MODEL,
     ]
     if allow_bash:
         cmd += ["--allowedTools", "Bash"]
@@ -81,7 +85,11 @@ SESSION_ARTEFACT_RE = re.compile(
     r"|Session:"                            # dump header
     r"|Working dir"                         # dump content
     r"|sk-sessions\.py"                     # script name in output
-    r"|(Developer|claude|workspace)/\w",    # project path fragment
+    r"|(Developer|claude|workspace)/\w"     # project path fragment
+    r"|session.{0,20}(history|crawl)"       # skill explaining what it needs
+    r"|Bash.{0,30}(session|script|crawl)"   # asking for Bash to run session script
+    r"|session.{0,30}Bash"                  # same, other order
+    r"|crawl.{0,30}session",                # crawl mention
     re.IGNORECASE,
 )
 
@@ -178,11 +186,12 @@ def main():
     parser = argparse.ArgumentParser(description="Tier 2 skill eval")
     parser.add_argument("--trigger-only", action="store_true")
     parser.add_argument("--e2e-only", action="store_true")
+    parser.add_argument("--model", default="claude-sonnet-4-6",
+                        help="Model to use (default: claude-sonnet-4-6)")
     args = parser.parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
+    global MODEL
+    MODEL = args.model
 
     results = []
 
