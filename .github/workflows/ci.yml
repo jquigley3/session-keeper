@@ -16,7 +16,9 @@ jobs:
           python-version: "3.11"
 
       - name: Check script syntax
-        run: python3 -m py_compile skills/session-summary/scripts/sk-sessions.py
+        run: |
+          python3 -m py_compile skills/session-summary/scripts/sk-sessions.py
+          python3 -m py_compile skills/token-manager/scripts/sk-tokens.py
 
       - name: Run unit tests
         run: python3 -m unittest discover -s test -p 'test_*.py' -v
@@ -25,13 +27,15 @@ jobs:
         run: |
           python3 - <<'EOF'
           import re, sys
-          text = open("skills/session-summary/SKILL.md").read()
-          fm = re.search(r"^---\n(.+?)\n---", text, re.DOTALL)
-          if not fm:
-              print("SKILL.md: missing frontmatter"); sys.exit(1)
-          body = fm.group(1)
-          for field in ("name:", "description:", "compatibility:"):
-              if field not in body:
-                  print(f"SKILL.md: missing '{field}'"); sys.exit(1)
-          print("SKILL.md frontmatter OK")
+          for skill in ("session-summary", "token-manager"):
+              path = f"skills/{skill}/SKILL.md"
+              text = open(path).read()
+              fm = re.search(r"^---\n(.+?)\n---", text, re.DOTALL)
+              if not fm:
+                  print(f"{path}: missing frontmatter"); sys.exit(1)
+              body = fm.group(1)
+              for field in ("name:", "description:", "compatibility:"):
+                  if field not in body:
+                      print(f"{path}: missing '{field}'"); sys.exit(1)
+              print(f"{path} frontmatter OK")
           EOF
