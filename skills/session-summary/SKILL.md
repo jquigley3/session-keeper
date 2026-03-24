@@ -3,6 +3,8 @@ name: session-summary
 description: Crawl and summarize Claude Code session history to answer "what am I working on?" Use this skill whenever the user asks what they've been doing, wants a summary of their recent Claude Code activity, asks which projects are active, wants to know where they left off, or asks to review sessions across projects. Trigger on phrases like "what am I working on", "summarize my sessions", "what have I been doing lately", "catch me up", "show my projects", or any question about recent Claude Code activity.
 compatibility:
   tools: [Bash]
+user-invocable: true
+homepage: https://github.com/jquigley3/session-keeper
 ---
 
 # Session Summary
