@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-CLAUDE_DIR = Path.home() / ".claude" / "projects"
+CLAUDE_DIR = Path.home() / ".claude" / "projects"  # overridable via --sessions-dir
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -112,13 +112,14 @@ def parse_session(jsonl_path: Path) -> dict | None:
     }
 
 
-def crawl_host() -> list[dict]:
+def crawl_host(sessions_dir: Path | None = None) -> list[dict]:
     """Crawl ~/.claude/projects for all sessions (excluding subagent files)."""
+    root = sessions_dir or CLAUDE_DIR
     sessions = []
-    if not CLAUDE_DIR.exists():
+    if not root.exists():
         return sessions
 
-    for jsonl in sorted(CLAUDE_DIR.glob("*/*.jsonl")):
+    for jsonl in sorted(root.glob("*/*.jsonl")):
         # Skip subagent files
         if "subagents" in jsonl.parts:
             continue
@@ -422,9 +423,12 @@ def main():
                         help="Dump dialogue for a session (by ID prefix)")
     parser.add_argument("--raw", action="store_true",
                         help="With --dump: skip noise filtering, show everything")
+    parser.add_argument("--sessions-dir", metavar="PATH",
+                        help="Override ~/.claude/projects (useful for testing)")
     args = parser.parse_args()
 
-    sessions = crawl_host()
+    sessions_dir = Path(args.sessions_dir) if args.sessions_dir else None
+    sessions = crawl_host(sessions_dir)
     if args.sandbox:
         sessions.extend(crawl_sandboxes())
 
