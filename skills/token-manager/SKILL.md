@@ -100,7 +100,33 @@ python3 <skill-dir>/scripts/sk-tokens.py --complex --json
 
 Returns an array of hit objects with: `session`, `project`, `line`, `role`, `label`, `matched` (masked), `context`.
 
-### Docker sandboxes
+### Scrubbing tokens from session history
+
+Once you've found tokens in session history, you can scrub them in place. The script rewrites JSONL files atomically, replacing token values with a masked form. Three modes:
+
+| Mode | Example output | Use when |
+|------|---------------|----------|
+| 1 (default) | `ghp_xxx2345` | You want to know which token it was |
+| 2 | `ghp_xx` | You want to keep the type identifier only |
+| 3 | `xxx` | Full redaction |
+
+```bash
+# Dry run first — see what would change
+python3 <skill-dir>/scripts/sk-tokens.py --scrub --dry-run
+
+# Scrub with mode 1 (keep prefix + last 4)
+python3 <skill-dir>/scripts/sk-tokens.py --scrub --scrub-mode 1
+
+# Scrub a specific known token (simple mode) with full redaction
+python3 <skill-dir>/scripts/sk-tokens.py --scrub --simple --name GITHUB_TOKEN --scrub-mode 3
+
+# Scrub and also clean the value out of .env
+python3 <skill-dir>/scripts/sk-tokens.py --scrub --scrub-mode 2 --remove-from-env
+```
+
+`--remove-from-env` replaces the value in `.env` with `[SCRUBBED]` so you retain the variable name as a record.
+
+## Docker sandboxes
 
 ```bash
 python3 <skill-dir>/scripts/sk-tokens.py --complex --sandbox

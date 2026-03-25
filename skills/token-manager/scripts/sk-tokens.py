@@ -1,22 +1,40 @@
 #!/usr/bin/env python3
 """
-sk-tokens.py — scrape Claude Code session history for tokens and secrets.
+sk-tokens.py — scrape and scrub Claude Code session history for tokens and secrets.
 
 Modes:
   --simple    Check ~/.claude/.env for known names/values, then find matches in
               session chat history. Answers: "where did I use this token?"
   --complex   Find potential tokens in chat that are NOT already in ~/.claude/.env.
               Answers: "what secrets have I typed into chat that I haven't catalogued?"
+  --scrub     Replace token values in session files. Combine with --simple or
+              --complex to select which tokens to target. Defaults to --complex.
+
+Scrub modes (--scrub-mode):
+  1  Keep the token prefix (ghp_, sk-ant-, etc.) and the last 4 characters;
+     replace the middle with xxx.  Example: ghp_ABCDEFxxx2345
+  2  Keep the token prefix only; replace everything else with xx.
+     Example: ghp_xx
+  3  Replace the entire token with xxx.
+     Example: xxx
 
 Usage:
   python3 sk-tokens.py [--simple | --complex]
   python3 sk-tokens.py --simple --name MY_TOKEN
   python3 sk-tokens.py --complex --pattern 'ghp_[a-zA-Z0-9]{36}'
   python3 sk-tokens.py --complex --json
+  python3 sk-tokens.py --scrub --scrub-mode 1
+  python3 sk-tokens.py --scrub --scrub-mode 2 --simple --name GITHUB_TOKEN
+  python3 sk-tokens.py --scrub --scrub-mode 3 --remove-from-env --dry-run
 
 Options:
   --simple            Search .env for known tokens, find them in session history
   --complex           Find potential tokens NOT in .env (default mode)
+  --scrub             Scrub found tokens from session files (and optionally .env)
+  --scrub-mode N      Scrub replacement style: 1 (prefix+xxx+last4), 2 (prefix+xx),
+                      3 (xxx). Default: 1
+  --remove-from-env   Also scrub matching tokens from the .env file
+  --dry-run           Show what would be changed without writing anything
   --env FILE          Path to .env file (default: ~/.claude/.env)
   --sessions DIR      Path to sessions dir (default: ~/.claude/projects/)
   --name NAME         Filter simple mode to a specific env var name
@@ -34,6 +52,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -89,6 +108,17 @@ _NOISE_VALUES = {
     'your-token', 'your_token', 'YOUR_TOKEN', 'xxx', 'yyy', 'abc', '123456',
     '<token>', '<key>', '<secret>', '[token]', '[key]',
 }
+
+# Known token prefixes, sorted longest-first for greedy matching
+_KNOWN_PREFIXES = sorted([
+    'github_pat_',
+    'sk-ant-oat01-', 'sk-ant-api03-', 'sk-ant-',
+    'sk_live_', 'sk_test_', 'pk_live_', 'pk_test_', 'rk_live_', 'rk_test_',
+    'xoxb-', 'xoxp-', 'xoxa-', 'xoxr-',
+    'ghp_', 'gho_', 'ghu_', 'ghs_',
+    'AKIA',
+    'SG.',
+], key=len, reverse=True)
 
 
 # ── .env parsing ──────────────────────────────────────────────────────────────
@@ -187,6 +217,236 @@ def mask_value(value: str, show_chars: int = 4) -> str:
     return value[:show_chars] + '…' + value[-show_chars:]
 
 
+# ── scrub helpers ─────────────────────────────────────────────────────────────
+
+def detect_prefix(value: str) -> str:
+    """Return the longest known token prefix that value starts with, or ''."""
+    for prefix in _KNOWN_PREFIXES:
+        if value.startswith(prefix):
+            return prefix
+    return ''
+
+
+def make_scrub_replacement(raw_value: str, mode: int) -> str:
+    """
+    Compute the scrubbed replacement for a token value.
+
+    mode 1: <prefix>xxx<last-4-of-full-value>   e.g. ghp_xxx2345
+    mode 2: <prefix>xx                           e.g. ghp_xx
+    mode 3: xxx                                  always
+    """
+    if mode == 3:
+        return 'xxx'
+
+    prefix = detect_prefix(raw_value)
+
+    if mode == 1:
+        tail = raw_value[-4:] if len(raw_value) > len(prefix) + 4 else ''
+        return f'{prefix}xxx{tail}'
+    else:  # mode == 2
+        return f'{prefix}xx'
+
+
+def scrub_file_content(content: str, replacements: dict[str, str]) -> tuple[str, int]:
+    """
+    Apply token replacements to raw file content.
+    Returns (new_content, total_replacement_count).
+
+    Note: tokens use only URL-safe characters that don't require JSON escaping,
+    so plain str.replace on raw content is safe for all JSONL files in practice.
+    """
+    new_content = content
+    count = 0
+    for raw, scrubbed in replacements.items():
+        occurrences = new_content.count(raw)
+        if occurrences:
+            new_content = new_content.replace(raw, scrubbed)
+            count += occurrences
+    return new_content, count
+
+
+def scrub_jsonl_file(path: Path, replacements: dict[str, str], dry_run: bool) -> int:
+    """
+    Replace token values in a JSONL session file.
+    Returns the number of replacements made (0 means file unchanged).
+    Uses an atomic write (tmp → rename) to avoid partial writes.
+    """
+    try:
+        content = path.read_text(errors='replace')
+    except OSError:
+        return 0
+
+    new_content, count = scrub_file_content(content, replacements)
+    if count > 0 and not dry_run:
+        tmp = path.with_suffix('.tmp')
+        try:
+            tmp.write_text(new_content, errors='replace')
+            tmp.rename(path)
+        except OSError as e:
+            print(f"  warning: could not write {path}: {e}", file=sys.stderr)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return count
+
+
+def scrub_env_file(env_path: Path, values_to_scrub: set[str], dry_run: bool) -> int:
+    """
+    For each line in .env whose value matches a token being scrubbed,
+    replace the value with [SCRUBBED]. Returns count of lines modified.
+    """
+    if not env_path.exists() or not values_to_scrub:
+        return 0
+
+    lines = env_path.read_text(errors='replace').splitlines(keepends=True)
+    new_lines = []
+    count = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('#') or '=' not in stripped:
+            new_lines.append(line)
+            continue
+        name, _, value = stripped.partition('=')
+        value = value.strip().strip('"').strip("'")
+        if value in values_to_scrub:
+            new_lines.append(f'{name.strip()}=[SCRUBBED]\n')
+            count += 1
+        else:
+            new_lines.append(line)
+
+    if count > 0 and not dry_run:
+        tmp = env_path.with_suffix('.tmp')
+        try:
+            tmp.write_text(''.join(new_lines), errors='replace')
+            tmp.rename(env_path)
+        except OSError as e:
+            print(f"  warning: could not write {env_path}: {e}", file=sys.stderr)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return count
+
+
+# ── shared hit collection ──────────────────────────────────────────────────────
+
+def _collect_complex_hits(
+    env: dict[str, str],
+    sessions_dir: Path,
+    days: int | None,
+    extra_patterns: list,
+) -> list[dict]:
+    """
+    Collect all token hits in complex mode (tokens NOT in .env).
+    Returns hits with raw (unmasked) values in 'raw' field.
+    Deduplicates by (label, raw_value).
+    """
+    known_values = set(env.values()) - {''}
+    patterns = BUILTIN_PATTERNS + [(pat, 'custom') for pat in extra_patterns]
+
+    hits = []
+    seen: set[tuple] = set()
+
+    for jsonl_path, proj_dir in iter_sessions(sessions_dir, days):
+        lines = extract_text_lines(jsonl_path)
+        if not lines:
+            continue
+
+        for lineno, role, text in lines:
+            for regex, label in patterns:
+                for m in regex.finditer(text):
+                    try:
+                        raw = m.group(1)
+                    except IndexError:
+                        raw = m.group(0)
+
+                    raw = raw.strip()
+                    if not raw or raw.lower() in _NOISE_VALUES:
+                        continue
+
+                    context_window = text[max(0, m.start()-30):m.end()+10]
+                    if label == 'hex-40' and _GIT_SHA_CONTEXT.search(context_window):
+                        continue
+
+                    if raw in known_values:
+                        continue
+
+                    if label in ('hex-40', 'named-credential', 'auth-header') and len(raw) < 12:
+                        continue
+
+                    key = (label, raw)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    hits.append({
+                        'session': jsonl_path.stem,
+                        'project': decode_project_dir(proj_dir),
+                        'jsonl': str(jsonl_path),
+                        'line': lineno,
+                        'role': role,
+                        'label': label,
+                        'raw': raw,
+                        'raw_length': len(raw),
+                        'context': _get_context(text, m.start(), m.end(), 1),
+                    })
+
+    return hits
+
+
+def _collect_simple_hits(
+    env: dict[str, str],
+    sessions_dir: Path,
+    name_filter: str | None,
+    days: int | None,
+    extra_patterns: list,
+) -> list[dict]:
+    """
+    Collect all token hits in simple mode (tokens from .env found in chat).
+    Returns hits with raw values in 'raw' field.
+    """
+    targets = {k: v for k, v in env.items() if not name_filter or k == name_filter}
+
+    searches = []
+    for name, value in targets.items():
+        if value:
+            searches.append((name, 'value', re.compile(re.escape(value)), value))
+    for pat in extra_patterns:
+        searches.append(('--pattern', 'custom', pat, None))
+
+    hits = []
+
+    for jsonl_path, proj_dir in iter_sessions(sessions_dir, days):
+        lines = extract_text_lines(jsonl_path)
+        if not lines:
+            continue
+
+        for lineno, role, text in lines:
+            for env_name, match_type, regex, known_raw in searches:
+                m = regex.search(text)
+                if not m:
+                    continue
+                raw = known_raw if known_raw else m.group(0)
+                hits.append({
+                    'session': jsonl_path.stem,
+                    'project': decode_project_dir(proj_dir),
+                    'jsonl': str(jsonl_path),
+                    'line': lineno,
+                    'role': role,
+                    'env_name': env_name,
+                    'match_type': match_type,
+                    'raw': raw,
+                    'raw_length': len(raw),
+                    'context': _get_context(text, m.start(), m.end(), 1),
+                })
+                break
+
+    return hits
+
+
 # ── simple mode ───────────────────────────────────────────────────────────────
 
 def run_simple(
@@ -199,10 +459,6 @@ def run_simple(
     as_json: bool,
     extra_patterns: list,
 ) -> int:
-    """
-    For each token in .env (optionally filtered to --name), search session
-    history for lines containing the token value or its name.
-    """
     if not env:
         print("No entries found in .env file.", file=sys.stderr)
         return 1
@@ -212,17 +468,14 @@ def run_simple(
         print(f"No entry named '{name_filter}' in .env.", file=sys.stderr)
         return 1
 
-    # Build search regexes: match the literal value OR the env var name
     searches = []
     for name, value in targets.items():
         searches.append((name, 'value', re.compile(re.escape(value)) if value else None))
         searches.append((name, 'name', re.compile(r'\b' + re.escape(name) + r'\b')))
-
-    # Add any extra agent-supplied patterns (searched under label 'custom')
     for pat in extra_patterns:
         searches.append(('--pattern', 'custom', pat))
 
-    hits = []  # list of hit dicts
+    hits = []
 
     for jsonl_path, proj_dir in iter_sessions(sessions_dir, days):
         lines = extract_text_lines(jsonl_path)
@@ -250,7 +503,7 @@ def run_simple(
                     'matched': display,
                     'context': _get_context(text, m.start(), m.end(), context_lines),
                 })
-                break  # one hit per line per search term is enough
+                break
 
     if as_json:
         print(json.dumps(hits, indent=2))
@@ -260,7 +513,6 @@ def run_simple(
         print("No matches found in session history.")
         return 0
 
-    # Group by env_name for display
     by_name: dict[str, list] = defaultdict(list)
     for h in hits:
         by_name[h['env_name']].append(h)
@@ -291,100 +543,132 @@ def run_complex(
     as_json: bool,
     extra_patterns: list,
 ) -> int:
-    """
-    Find potential tokens/secrets in session chat that are NOT already in .env.
-    Uses built-in patterns + any --pattern args.
-    """
-    known_values = set(env.values()) - {''}
-
-    patterns = BUILTIN_PATTERNS + [(pat, 'custom') for pat in extra_patterns]
-
-    hits = []
-
-    for jsonl_path, proj_dir in iter_sessions(sessions_dir, days):
-        lines = extract_text_lines(jsonl_path)
-        if not lines:
-            continue
-
-        for lineno, role, text in lines:
-            for regex, label in patterns:
-                for m in regex.finditer(text):
-                    # Use group(1) if available (named-credential, auth-header patterns)
-                    # otherwise group(0)
-                    try:
-                        raw = m.group(1)
-                    except IndexError:
-                        raw = m.group(0)
-
-                    raw = raw.strip()
-                    if not raw or raw.lower() in _NOISE_VALUES:
-                        continue
-
-                    # Skip if it looks like a git SHA in context
-                    context_window = text[max(0, m.start()-30):m.end()+10]
-                    if label == 'hex-40' and _GIT_SHA_CONTEXT.search(context_window):
-                        continue
-
-                    # Skip if already in .env
-                    if raw in known_values:
-                        continue
-
-                    # Skip very short matches for broad patterns
-                    if label in ('hex-40', 'named-credential', 'auth-header') and len(raw) < 12:
-                        continue
-
-                    display = mask_value(raw) if do_mask else raw
-
-                    hits.append({
-                        'session': jsonl_path.stem,
-                        'project': decode_project_dir(proj_dir),
-                        'jsonl': str(jsonl_path),
-                        'line': lineno,
-                        'role': role,
-                        'label': label,
-                        'matched': display,
-                        'raw_length': len(raw),
-                        'context': _get_context(text, m.start(), m.end(), context_lines),
-                    })
-
-    # Deduplicate: same masked value + same label across multiple sessions
-    # Keep first occurrence per unique (label, masked_value)
-    seen: set[tuple] = set()
-    deduped = []
-    for h in hits:
-        key = (h['label'], h['matched'])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(h)
+    hits = _collect_complex_hits(env, sessions_dir, days, extra_patterns)
 
     if as_json:
-        print(json.dumps(deduped, indent=2))
+        display_hits = [
+            {**{k: v for k, v in h.items() if k != 'raw'},
+             'matched': mask_value(h['raw']) if do_mask else h['raw']}
+            for h in hits
+        ]
+        print(json.dumps(display_hits, indent=2))
         return 0
 
-    if not deduped:
+    if not hits:
         print("No uncatalogued tokens found in session history.")
         return 0
 
-    # Group by label
     by_label: dict[str, list] = defaultdict(list)
-    for h in deduped:
+    for h in hits:
         by_label[h['label']].append(h)
 
-    print(f"\nFound {len(deduped)} potential uncatalogued secret(s):\n")
+    print(f"\nFound {len(hits)} potential uncatalogued secret(s):\n")
 
     for label, group in sorted(by_label.items()):
         print(f"  [{label}]  {len(group)} unique value(s)")
         print('  ' + '─' * 58)
         for h in group:
+            display = mask_value(h['raw']) if do_mask else h['raw']
             print(f"    {h['project']}")
             print(f"    session {h['session'][:8]}  line {h['line']}  [{h['role']}]  len={h['raw_length']}")
-            print(f"    value: {h['matched']}")
+            print(f"    value: {display}")
             if h['context']:
                 for ctx_line in h['context'].splitlines():
                     print(f"      {ctx_line}")
             print()
 
     print("Consider adding these to ~/.claude/.env with descriptive names.")
+    return 0
+
+
+# ── scrub mode ────────────────────────────────────────────────────────────────
+
+def run_scrub(
+    use_simple: bool,
+    env: dict[str, str],
+    env_path: Path,
+    sessions_dir: Path,
+    name_filter: str | None,
+    days: int | None,
+    extra_patterns: list,
+    scrub_mode: int,
+    dry_run: bool,
+    remove_from_env: bool,
+) -> int:
+    """
+    Find tokens (via simple or complex mode) and scrub them from session files.
+    In dry-run mode, shows what would change without writing.
+    """
+    # Collect raw token values
+    if use_simple:
+        if not env:
+            print("No entries found in .env file.", file=sys.stderr)
+            return 1
+        hits = _collect_simple_hits(env, sessions_dir, name_filter, days, extra_patterns)
+    else:
+        hits = _collect_complex_hits(env, sessions_dir, days, extra_patterns)
+
+    if not hits:
+        print("No tokens found to scrub.")
+        return 0
+
+    # Build replacements map: raw_value → scrubbed_value
+    raw_values: set[str] = {h['raw'] for h in hits}
+    replacements: dict[str, str] = {
+        raw: make_scrub_replacement(raw, scrub_mode)
+        for raw in raw_values
+    }
+
+    # Show plan
+    mode_desc = {
+        1: 'prefix + xxx + last-4',
+        2: 'prefix + xx',
+        3: 'xxx',
+    }[scrub_mode]
+
+    prefix = '  [DRY RUN] ' if dry_run else '  '
+    print(f"\nScrub mode {scrub_mode}: {mode_desc}")
+    print(f"{'Dry run — no files will be modified.' if dry_run else 'Writing changes.'}\n")
+    print(f"  Tokens to scrub: {len(replacements)}")
+    for raw, scrubbed in sorted(replacements.items(), key=lambda kv: kv[0]):
+        print(f"  {mask_value(raw)}  →  {scrubbed}")
+    print()
+
+    # Group hits by file for efficient processing
+    by_file: dict[str, set[str]] = defaultdict(set)
+    for h in hits:
+        by_file[h['jsonl']].add(h['raw'])
+
+    # Scrub session files
+    total_files = 0
+    total_replacements = 0
+
+    for jsonl_path_str, file_raw_values in sorted(by_file.items()):
+        jsonl_path = Path(jsonl_path_str)
+        file_replacements = {r: replacements[r] for r in file_raw_values if r in replacements}
+        count = scrub_jsonl_file(jsonl_path, file_replacements, dry_run)
+        if count > 0:
+            total_files += 1
+            total_replacements += count
+            rel = jsonl_path.name[:8]
+            print(f"{prefix}{'would scrub' if dry_run else 'scrubbed'}  {rel}…  "
+                  f"({count} replacement{'s' if count != 1 else ''})"
+                  f"  {jsonl_path.parent.name[:40]}")
+
+    print(f"\n  Session files: {total_files} modified, {total_replacements} replacement(s) total")
+
+    # Scrub .env
+    if remove_from_env:
+        env_count = scrub_env_file(env_path, raw_values, dry_run)
+        if env_count > 0:
+            print(f"{prefix}{'would update' if dry_run else 'updated'}  {env_path}  "
+                  f"({env_count} value{'s' if env_count != 1 else ''} scrubbed → [SCRUBBED])")
+        else:
+            print(f"  .env: no matching values found")
+
+    if dry_run:
+        print("\n  Run without --dry-run to apply changes.")
+
     return 0
 
 
@@ -395,14 +679,13 @@ def _get_context(text: str, start: int, end: int, n_lines: int) -> str:
     if n_lines <= 0:
         return ''
     lines = text.splitlines()
-    # Find which line the match falls on
     pos = 0
     match_line_idx = 0
     for i, line in enumerate(lines):
         if pos + len(line) >= start:
             match_line_idx = i
             break
-        pos += len(line) + 1  # +1 for newline
+        pos += len(line) + 1
 
     lo = max(0, match_line_idx - n_lines)
     hi = min(len(lines), match_line_idx + n_lines + 1)
@@ -412,7 +695,6 @@ def _get_context(text: str, start: int, end: int, n_lines: int) -> str:
 def crawl_sandbox_sessions(sessions_dir: Path, days: int | None):
     """
     Extend session iteration with sessions from running Docker sandbox containers.
-    Containers with /root/.claude/projects/ are eligible.
     """
     try:
         result = subprocess.run(
@@ -440,8 +722,6 @@ def crawl_sandbox_sessions(sessions_dir: Path, days: int | None):
             fpath = fpath.strip()
             if not fpath:
                 continue
-            # Copy the file out to a temp path and yield it
-            import tempfile
             with tempfile.NamedTemporaryFile(suffix='.jsonl', delete=False) as tf:
                 tmp = Path(tf.name)
             cp2 = subprocess.run(
@@ -458,7 +738,7 @@ def crawl_sandbox_sessions(sessions_dir: Path, days: int | None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Scrape Claude Code session history for tokens and secrets.',
+        description='Scrape and scrub Claude Code session history for tokens and secrets.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -468,6 +748,16 @@ def main():
                           help='Find .env tokens in session history')
     mode_grp.add_argument('--complex', action='store_true',
                           help='Find uncatalogued tokens not in .env (default)')
+
+    parser.add_argument('--scrub', action='store_true',
+                        help='Scrub found tokens from session files')
+    parser.add_argument('--scrub-mode', type=int, choices=[1, 2, 3], default=1,
+                        metavar='N',
+                        help='1=prefix+xxx+last4 (default), 2=prefix+xx, 3=xxx')
+    parser.add_argument('--remove-from-env', action='store_true',
+                        help='Also scrub matching token values from .env')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would change without writing')
 
     parser.add_argument('--env', type=Path,
                         default=Path.home() / '.claude' / '.env',
@@ -479,8 +769,7 @@ def main():
                         help='[simple mode] filter to a specific env var name')
     parser.add_argument('--pattern', action='append', dest='patterns', default=[],
                         metavar='RE',
-                        help='Additional regex pattern (repeatable). '
-                             'Use group(1) to capture the secret value.')
+                        help='Additional regex pattern (repeatable).')
     parser.add_argument('--context', type=int, default=1, metavar='N',
                         help='Lines of context around each match (default: 1)')
     parser.add_argument('--json', action='store_true',
@@ -506,8 +795,21 @@ def main():
             sys.exit(1)
 
     if not args.simple and not args.complex:
-        # default to complex
         args.complex = True
+
+    if args.scrub:
+        return run_scrub(
+            use_simple=args.simple,
+            env=env,
+            env_path=args.env,
+            sessions_dir=args.sessions,
+            name_filter=args.name,
+            days=args.days,
+            extra_patterns=extra_patterns,
+            scrub_mode=args.scrub_mode,
+            dry_run=args.dry_run,
+            remove_from_env=args.remove_from_env,
+        )
 
     if args.simple:
         if not env and not extra_patterns:

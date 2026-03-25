@@ -191,6 +191,207 @@ class TestBuiltinPatterns(unittest.TestCase):
         self.assertIsNotNone(p.search(fake))
 
 
+# ── detect_prefix ────────────────────────────────────────────────────────────
+
+class TestDetectPrefix(unittest.TestCase):
+
+    def test_github_pat(self):
+        self.assertEqual(sk.detect_prefix("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"), "ghp_")
+
+    def test_anthropic_key(self):
+        self.assertEqual(sk.detect_prefix("sk-ant-api03-somekey"), "sk-ant-api03-")
+
+    def test_anthropic_oauth(self):
+        self.assertEqual(sk.detect_prefix("sk-ant-oat01-somekey"), "sk-ant-oat01-")
+
+    def test_anthropic_generic(self):
+        # sk-ant- without more specific sub-prefix
+        self.assertEqual(sk.detect_prefix("sk-ant-other-somekey"), "sk-ant-")
+
+    def test_slack(self):
+        self.assertEqual(sk.detect_prefix("xoxb-123-abc"), "xoxb-")
+
+    def test_no_prefix(self):
+        self.assertEqual(sk.detect_prefix("abc1234def5678901234567890abcdef12345678"), "")
+
+    def test_hex_no_prefix(self):
+        self.assertEqual(sk.detect_prefix("f3f3fa84e1314599540c9de6a7fabdb81bc7368a"), "")
+
+    def test_github_fine_grained(self):
+        self.assertEqual(sk.detect_prefix("github_pat_something"), "github_pat_")
+
+
+# ── make_scrub_replacement ────────────────────────────────────────────────────
+
+class TestMakeScrubReplacement(unittest.TestCase):
+
+    PAT = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"
+
+    def test_mode1_keeps_prefix_and_last4(self):
+        result = sk.make_scrub_replacement(self.PAT, 1)
+        self.assertTrue(result.startswith("ghp_xxx"))
+        self.assertTrue(result.endswith("2345"))
+
+    def test_mode2_keeps_prefix_only(self):
+        result = sk.make_scrub_replacement(self.PAT, 2)
+        self.assertEqual(result, "ghp_xx")
+
+    def test_mode3_replaces_all(self):
+        result = sk.make_scrub_replacement(self.PAT, 3)
+        self.assertEqual(result, "xxx")
+
+    def test_mode1_no_prefix_still_works(self):
+        hex_token = "f3f3fa84e1314599540c9de6a7fabdb81bc7368a"
+        result = sk.make_scrub_replacement(hex_token, 1)
+        self.assertTrue(result.startswith("xxx"))
+        self.assertTrue(result.endswith("368a"))
+
+    def test_mode2_no_prefix(self):
+        hex_token = "f3f3fa84e1314599540c9de6a7fabdb81bc7368a"
+        result = sk.make_scrub_replacement(hex_token, 2)
+        self.assertEqual(result, "xx")
+
+    def test_anthropic_mode1(self):
+        key = "sk-ant-api03-verylongkeyvalue1234567890"
+        result = sk.make_scrub_replacement(key, 1)
+        self.assertTrue(result.startswith("sk-ant-api03-xxx"))
+        self.assertTrue(result.endswith("7890"))
+
+    def test_mode1_result_does_not_contain_raw_middle(self):
+        result = sk.make_scrub_replacement(self.PAT, 1)
+        # Middle characters should not appear
+        self.assertNotIn("ABCDEFGHIJKLM", result)
+
+
+# ── scrub_file_content ────────────────────────────────────────────────────────
+
+class TestScrubFileContent(unittest.TestCase):
+
+    def test_replaces_known_token(self):
+        content = 'my token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345 done'
+        replacements = {"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345": "ghp_xxx2345"}
+        new_content, count = sk.scrub_file_content(content, replacements)
+        self.assertEqual(count, 1)
+        self.assertIn("ghp_xxx2345", new_content)
+        self.assertNotIn("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ", new_content)
+
+    def test_multiple_occurrences_counted(self):
+        token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"
+        content = f"token={token} and again {token}"
+        replacements = {token: "ghp_xxx2345"}
+        _, count = sk.scrub_file_content(content, replacements)
+        self.assertEqual(count, 2)
+
+    def test_no_match_returns_original(self):
+        content = "nothing to scrub here"
+        new_content, count = sk.scrub_file_content(content, {"sometoken": "xxx"})
+        self.assertEqual(count, 0)
+        self.assertEqual(new_content, content)
+
+    def test_multiple_tokens_replaced(self):
+        content = "token1=aaaa1111bbbb2222cccc3333dddd4444 token2=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"
+        replacements = {
+            "aaaa1111bbbb2222cccc3333dddd4444": "xxx",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345": "ghp_xx",
+        }
+        new_content, count = sk.scrub_file_content(content, replacements)
+        self.assertEqual(count, 2)
+        self.assertIn("xxx", new_content)
+        self.assertIn("ghp_xx", new_content)
+
+
+# ── scrub_jsonl_file ──────────────────────────────────────────────────────────
+
+class TestScrubJsonlFile(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mktemp(suffix=".jsonl"))
+        token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"
+        self.tmp.write_text(
+            '{"message":{"role":"user","content":"my token is ' + token + '"}}\n'
+        )
+        self.token = token
+
+    def tearDown(self):
+        self.tmp.unlink(missing_ok=True)
+
+    def test_dry_run_does_not_write(self):
+        original = self.tmp.read_text()
+        count = sk.scrub_jsonl_file(self.tmp, {self.token: "ghp_xxx2345"}, dry_run=True)
+        self.assertEqual(count, 1)
+        self.assertEqual(self.tmp.read_text(), original)  # unchanged
+
+    def test_write_replaces_token(self):
+        count = sk.scrub_jsonl_file(self.tmp, {self.token: "ghp_xxx2345"}, dry_run=False)
+        self.assertEqual(count, 1)
+        content = self.tmp.read_text()
+        self.assertIn("ghp_xxx2345", content)
+        self.assertNotIn(self.token, content)
+
+    def test_missing_file_returns_zero(self):
+        count = sk.scrub_jsonl_file(Path("/nonexistent/file.jsonl"), {"x": "y"}, dry_run=False)
+        self.assertEqual(count, 0)
+
+
+# ── scrub_env_file ────────────────────────────────────────────────────────────
+
+class TestScrubEnvFile(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mktemp(suffix=".env"))
+        self.tmp.write_text(
+            "# comment\n"
+            "GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345\n"
+            "OTHER_KEY=someothervalue\n"
+        )
+
+    def tearDown(self):
+        self.tmp.unlink(missing_ok=True)
+
+    def test_dry_run_does_not_write(self):
+        original = self.tmp.read_text()
+        count = sk.scrub_env_file(
+            self.tmp,
+            {"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"},
+            dry_run=True,
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(self.tmp.read_text(), original)
+
+    def test_matching_value_replaced_with_scrubbed(self):
+        count = sk.scrub_env_file(
+            self.tmp,
+            {"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"},
+            dry_run=False,
+        )
+        self.assertEqual(count, 1)
+        content = self.tmp.read_text()
+        self.assertIn("GITHUB_TOKEN=[SCRUBBED]", content)
+        self.assertNotIn("ghp_ABCDEF", content)
+
+    def test_non_matching_value_unchanged(self):
+        sk.scrub_env_file(
+            self.tmp,
+            {"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"},
+            dry_run=False,
+        )
+        content = self.tmp.read_text()
+        self.assertIn("OTHER_KEY=someothervalue", content)
+
+    def test_comment_lines_preserved(self):
+        sk.scrub_env_file(
+            self.tmp,
+            {"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345"},
+            dry_run=False,
+        )
+        content = self.tmp.read_text()
+        self.assertIn("# comment", content)
+
+    def test_missing_file_returns_zero(self):
+        count = sk.scrub_env_file(Path("/nonexistent/.env"), {"token"}, dry_run=False)
+        self.assertEqual(count, 0)
+
+
 # ── git SHA filtering ─────────────────────────────────────────────────────────
 
 class TestGitShaFiltering(unittest.TestCase):
